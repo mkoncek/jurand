@@ -1,5 +1,8 @@
 -std=c++2a
 -Isrc
+-I/usr/lib/jvm/java/include
+-I/usr/lib/jvm/java/include/linux
+-Itarget/generated/jni
 -Wall
 -Wextra
 -Wpedantic
