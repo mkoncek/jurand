@@ -13,6 +13,7 @@
 #include <string_view>
 #include <tuple>
 #include <optional>
+#include <thread>
 #include <mutex>
 #include <optional>
 #include <type_traits>
@@ -749,5 +750,199 @@ inline Parameters interpret_args(const Parameter_dict& parameters)
 	}
 	
 	return result;
+}
+
+/*!
+ * Executes the main tool over @p fileroots using @p parameters for
+ * configuration.
+ * 
+ * @return An integer value representing the kind of error or 0 on success and
+ * a string containing the error message or an empty string on success.
+ * The meaning of returned integer values is:
+ *   1: Invalid argument.
+ *   2: Runtime error.
+ *   3: Strict mode error.
+ * @p fileroots The files or directories on which the tool should be executed.
+ * @p parameters Configuration for the tool.
+ */
+inline std::tuple<int, std::string> execute(std::span<const std::string_view> fileroots, const Parameters parameters)
+{
+	if (parameters.names_.empty() and parameters.patterns_.empty())
+	{
+		return std::tuple(1, "jurand: no matcher specified");
+	}
+	
+	if (fileroots.empty())
+	{
+		if (parameters.in_place_)
+		{
+			return std::tuple(1, "jurand: no input files");
+		}
+		
+		try
+		{
+			handle_file({}, parameters);
+		}
+		catch (std::exception& ex)
+		{
+			return std::tuple(2, ex.what());
+		}
+		
+		return std::tuple(0, std::string());
+	}
+	
+	auto files_count = std::atomic<std::ptrdiff_t>(0);
+	auto files = std::vector<Path_origin_entry>();
+	files.reserve(32);
+	
+	for (auto fileroot : fileroots)
+	{
+		auto to_handle = std::filesystem::path(fileroot);
+		
+		if (not std::filesystem::exists(to_handle))
+		{
+			return std::tuple(2, "jurand: file does not exist: " + to_handle.native());
+		}
+		
+		if (std::filesystem::is_regular_file(to_handle) and not std::filesystem::is_symlink(to_handle))
+		{
+			files.emplace_back(Path_origin_entry(std::move(to_handle), fileroot));
+		}
+		else if (std::filesystem::is_directory(to_handle))
+		{
+			for (const auto& dir_entry : std::filesystem::recursive_directory_iterator(to_handle))
+			{
+				to_handle = dir_entry;
+				
+				if (std::filesystem::is_regular_file(to_handle)
+					and not std::filesystem::is_symlink(to_handle)
+					and to_handle.native().ends_with(".java"))
+				{
+					files.emplace_back(Path_origin_entry(std::move(to_handle), fileroot));
+				}
+			}
+		}
+	}
+	
+	if (files.empty())
+	{
+		return std::tuple(1, "jurand: no valid input files");
+	}
+	
+	if (parameters.strict_mode_)
+	{
+		strict_mode.emplace();
+		
+		for (auto fileroot : fileroots)
+		{
+			strict_mode->files_truncated_.lock().get().try_emplace(fileroot);
+		}
+		
+		for (const auto& pattern : parameters.patterns_)
+		{
+			strict_mode->patterns_matched_.lock().get().try_emplace(pattern);
+		}
+		
+		for (const auto& name : parameters.names_)
+		{
+			strict_mode->names_matched_.lock().get().try_emplace(name);
+		}
+	}
+	
+	auto threads = std::vector<std::thread>(std::min(std::size(files), std::max<std::size_t>(1, std::thread::hardware_concurrency())));
+	
+	auto errors = Mutex<std::vector<std::string>>();
+	
+	for (auto& thread : threads)
+	{
+		thread = std::thread([&]() noexcept -> void
+		{
+			while (true)
+			{
+				auto index = files_count.fetch_add(1, std::memory_order_acq_rel);
+				
+				if (index >= std::ssize(files))
+				{
+					break;
+				}
+				
+				try
+				{
+					handle_file(std::move(files[index]), parameters);
+				}
+				catch (std::exception& ex)
+				{
+					errors.lock().get().emplace_back(ex.what());
+				}
+			}
+		});
+	}
+	
+	for (auto& thread : threads)
+	{
+		thread.join();
+	}
+	
+	threads.clear();
+	
+	int exit_code = 0;
+	std::string error_message;
+	
+	if (auto& errors_unlocked = errors.lock().get(); not errors_unlocked.empty())
+	{
+		exit_code = 2;
+		error_message += "jurand: exceptions occured during the process:";
+		
+		for (const auto& error : errors_unlocked)
+		{
+			error_message += "\n* ";
+			error_message += error;
+		}
+	}
+	else if (strict_mode)
+	{
+		for (const auto& file_entry : strict_mode->files_truncated_.lock().get())
+		{
+			if (not file_entry.second)
+			{
+				error_message += "jurand: strict mode: no changes were made in ";
+				error_message += file_entry.first;
+				exit_code = 3;
+			}
+		}
+		
+		for (const auto& name_entry : strict_mode->names_matched_.lock().get())
+		{
+			if (not name_entry.second)
+			{
+				error_message += error_message.empty() ? "" : "\n";
+				error_message += "jurand: strict mode: simple name ";
+				error_message += name_entry.first;
+				error_message += " did not match anything";
+				exit_code = 3;
+			}
+		}
+		
+		for (const auto& pattern_entry : strict_mode->patterns_matched_.lock().get())
+		{
+			if (not pattern_entry.second)
+			{
+				error_message += error_message.empty() ? "" : "\n";
+				error_message += "jurand: strict mode: pattern ";
+				error_message += pattern_entry.first;
+				error_message += " did not match anything";
+				exit_code = 3;
+			}
+		}
+		
+		if (parameters.also_remove_annotations_ and not strict_mode->any_annotation_removed_.load(std::memory_order_acquire))
+		{
+			error_message += error_message.empty() ? "" : "\n";
+			error_message += "jurand: strict mode: -a was specified but no annotation was removed";
+			exit_code = 3;
+		}
+	}
+	
+	return std::tuple(exit_code, error_message);
 }
 } // namespace java_symbols

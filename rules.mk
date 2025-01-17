@@ -8,7 +8,7 @@ Manpage = $(addprefix target/manpages/,$(1))
 clean:
 	@rm -rfv target
 
-target target/object_files target/dependencies target/bin target/coverage target/manpages:
+target target/object_files target/dependencies target/bin target/coverage target/manpages target/lib:
 	@mkdir -p $@
 
 define Variable_rule # target_file, string_value
@@ -24,7 +24,7 @@ target/manpages/%: manpages/%.adoc
 
 # $(call Object_file,%) $(call Dependency_file,%)&: src/%.cpp target/compile_flags | target/object_files target/dependencies
 $(call Object_file,%): src/%.cpp target/compile_flags | target/object_files target/dependencies
-	$(CXX) $(CXXFLAGS) -MMD -MP -MF $(call Dependency_file,$(<F)) -MT $(call Object_file,$(<F)) -c -o $(call Object_file,$(<F)) $(addprefix src/,$(<F))
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(call Dependency_file,$(<F)) -MT $(call Object_file,$(<F)) -c -o $(call Object_file,$(<F)) $(addprefix src/,$(<F))
 
 $(call Executable_file,%): target/link_flags | target/bin
 	$(CXX) -o $@ $(LDFLAGS) $(wordlist 2,$(words $^),$^) $(LDLIBS)
